@@ -1,0 +1,1067 @@
+---
+fontsize: 12pt
+linestretch: 1.25
+output:
+  pdf_document:
+    fig_caption: yes
+    includes:
+      before_body: title.sty
+    toc_depth: 2
+subtitle: Analysing the Wirkungsdauermessprogramm
+---
+\newpage
+\tableofcontents
+\newpage
+\pagenumbering{arabic}
+
+```{r setup, include = FALSE}
+
+#require necessary libraries
+require("rgdal")
+require("ggplot2")
+require("maptools")
+require("plyr")
+require("ggrepel")
+require("rgeos")
+require("forecast")
+require("sp")
+require("gstat")
+require("png")
+
+# set working directory
+setwd(".")
+
+# read in data about stations and save it to variable
+stations <- read.csv("./data/stations.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+
+# read in data sets:
+# 30 entries 
+arsenic <- read.csv("./data/arsenic.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+# 45 entries
+chromium <- read.csv("./data/chromium.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+# 60 entries
+copper <- read.csv("./data/copper.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+# 150 entries
+cadmium <- read.csv("./data/cadmium.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+lead <- read.csv("./data/lead.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+nickel <- read.csv("./data/nickel.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+zinc <- read.csv("./data/zinc.csv", sep=";", header = TRUE, stringsAsFactors = FALSE)
+```
+
+\setcounter{page}{1}
+
+# 1. Introduction
+This report details the analysis conducted for the final assignment of the course "Analysis of Spatio-Temporal Data" held at the Westfälische Wilhelms-Universität Münster in the winter term of 2018/2019 by Prof. Dr. Edzer Pebesma.  
+The topic chosen for this final assignment was "Wirkungsdauermessprogramm: Analyzing the Air Quality in North Rhine-Westphalia".   
+The Wirkungsdauermessprogramm (WDMP) is an initiative from the Ministry for Environment, Agriculture, Conservation and Consumer Protection of the State of North Rhine-Westphalia for long term monitoring of emissions, conceptualized and implemented in 1995.[1]  
+At the time of this analysis 14 measuring stations were used by the WDMP, distributed across North Rhine-Westphalia (NRW) (see Figure \ref{fig:stations}).\newline
+
+```{r map, include = TRUE, echo = FALSE, fig.cap = "Measuring Stations in NRW (own illustration)\\label{fig:stations}", fig.height = 4, fig.width = 6, fig.align = "center", fig.pos="h"}
+
+# build vectors
+name <- c(stations$name)
+east <- c(stations$etrs_east)
+north <- c(stations$etrs_north)
+
+# merge vectors to data frame
+stations.df <- data.frame(name, east, north)
+
+# transform UTM data to lat long
+tmp <- data.frame(coords.x = stations.df$east, coords.y = stations.df$north)
+coordinates(tmp) <-c("coords.x", "coords.y")
+proj4string(tmp) <- CRS("+proj=utm +zone=32 ellps=WGS84") 
+CRS.new <- CRS("+init=epsg:4326")
+coords <- spTransform(tmp, CRS.new)
+stations <- data.frame(name = stations.df$name, long = coords@coords[,1], lat = coords@coords[,2])
+
+# read boder shapefile
+nrw <- readOGR("./data/nrw_border", "nrw_border", verbose = FALSE)
+nrw@data$id <- rownames(nrw@data)
+nrw.points <- fortify(nrw, region = "id")
+nrw.df <- join(nrw.points, nrw@data, by = "id")
+
+# build map
+stations_plot <- ggplot(nrw.df, aes( x =long, y = lat)) + 
+  geom_polygon() + 
+  geom_point(data = stations, aes(color = "red")) + 
+  theme(legend.position = "none") +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Measuring Stations in North Rhine-Westphalia"
+)
+
+# plot map with station labels
+stations_plot +  
+  geom_label_repel(data = stations, aes(label = name),
+    fill = "white",
+    box.padding = 0.35, 
+    point.padding = 0.5,
+    segment.color = 'grey50'
+)
+
+```
+
+## 1.1 Motivation
+The choice of this topic has been motivated by multiple circumstances.  
+The first and foremost reason for this topic was the availability of high-quality data. The data used for this analysis is provided by the government of NRW. Therefore, it was easily discovered and accessed (see 2.1). In addition, the data is of high quality, i.e. neatly sorted and appended with  context information easing interpretation, and is credible due to its source.  
+Additional reasons for this topic are a connection to the life of the lecture's students and personal interest. My personal interests lie within the fields of biology, ecology and chemistry and thus match to the chosen topic.   Furthermore, the university at which this course is taught is situated within NRW and thus the air quality analysed here affects the students.
+
+## 1.2 Research Questions
+The goal of the analysis conducted was to evaluate the air conditions in NRW, based on of the data provided by the WDMP. This evaluation consists of four research questions, complementing the spatio-temporal character of the data:
+
+\begin{enumerate}
+\item [(I)]Was the air quality at the beginning of the WDMP poor?  
+\item [(II)]Has the air quality improved since the beginning of the measurements?  
+\item [(III)]How is the air quality expected to develop?  
+\item [(IV)]Do discernible hotspots of pollution exist?  
+
+\end{enumerate}
+
+## 1.3 Hypotheses
+Historically the air quality in NRW has been poor multiple times as exemplified by the smog crises of 1962 [2] and a level 3 smog alarm in 1985 [3]. Therefore, it can be hypothesized, in regard to (I), the air quality in 1998 has been poor to.  
+Based on a rough skimming of the data hypotheses towards (II) and (III) can be raised. The air quality has improved since 1998 (II) and will continue to improve (III).  
+A hypothesis about pollution hotspots (IV) can be deducted from the situation of some measurement stations in the Ruhrgebiet, an agglomeration of industry. Thus, differences in measurements between Ruhrgebiet and non-Ruhrgebiet stations are to be expected and hence hotspots, too.
+
+\newpage
+# 2. Data
+This chapter details the data used for the analysis, beginning with its acquisition.  
+Subsequently the properties of the data and the steps taken to prepare it for the analysis are described.
+
+## 2.1 Acquisition 
+Data acquisition was the first step of the analysis. As data availability was of great concern, the data acquisition preceded even the choice of the topic.  
+Data was searched for at multiple sources, such as open.nrw [4], where the WDMP data was discovered and a download source was provided [5].  
+The WDMP offers two data sets, one generated using grass as the indicator, the other one using kale. As the measurement medium was of no special concern, the grass data set was chosen, as more measurements were available.  
+Additionally, a means to plot the border of NRW was needed for visualizing the WDMP data. A shapefile containing all administrative border of Germany was procured from ArcGIS [6] to do so.  
+
+## 2.2 Description
+The data is provided as an excel workbook with 19 worksheets.  
+The first sheet contains the measuring stations and their geographic location provided in EPSG:25832. The second sheet features remarks about the data. The remaining 17 sheets contain the measurement data. 
+The first measurements were taken in 1998 and the most recent ones in 2017. The measuring intervals were highly irregular though. Measurements were taken either every two weeks, four weeks or summarized for an entire year depending on compound and year.  
+Most compound measurements feature a break in their intervals or methods. This break shows as either less measurements taken after a certain point in time or summarizing the multiple measurements of a year into one value.   
+An overview of the compounds and their properties has been provided in Figure \ref{fig:overview}.
+
+
+## 2.3 Preparation
+To prepare the data for analysis in R the measurements were manually transferred into CSV files, one for each compound. While doing so the additional information in the sheets was omitted.  
+Afterwards the data needed to be narrowed down. This was accomplished by determining how many cities had sparse measurements.
+Here sparse was defined as having less than half the maximum amount of measurement values. Only compounds with less than 6 such cities were then used for the analysis (see Figure \ref{fig:overview}).  
+The result of the preparation phase were eight CSV files: Seven compound specific files and one detailing the measuring stations.  
+The border of NRW was extracted manually from the acquired shapefile. This was done in QGIS by selecting the polygon of it and exporting it as a shapfile, omitting the additional data.
+
+\newpage
+# 3. Methods
+This chapter details the methods used to answer the research questions posed. The methods will be described sequentially in order of the research questions.
+
+## 3.1 Research Question I
+To determine whether the air conditions at the beginning of the WDMP were poor the compounds measured at its beginning in 1998 were analyzed. These compounds are Cadmium, Lead, Nickel and Zinc. For each of these compounds the number of transgressions of the Orientierungswert für den maximalen Hintergrundgehalt (OmH) [7] per city between 1998 and 2001 was counted.  
+This was accomplished by selecting the values from the read CSV files and assigning them to a separate data frame each. In this data frame all NAs were replaced by 0 to avoid errors while counting. Then values higher than the OmH were counted using a loop [8].   
+The results of this count were visualized as bar charts. Furthermore, the total number of transgressions per compound was calculated and likewise visualized as a bar chart.
+
+## 3.2 Research Question II
+Improvements in air quality during the WDMP were determined using the mean measurement value of each compound. These means were calculated by building a data frame for each compound, omitting the NAs, and then using the rowMeans() function.  
+After this, the resulting data frames were used to build a time series for each compound. Using the time series, a trend was determined, employing the decompose() function. Afterwards the means and trends were plotted. This allowed for detection of the general development tendencies.  
+In addition the changes were calculated as percentages. To do so the  mean of the first measurement was determinedand the last available trend value extracted. To get the change percentage the trend values was divided by the means.  
+Additionally, the values were shifted and visualized as a bar chart [9].  
+
+## 3.3 Research Question III
+To estimate further developments of the concentration of the compounds time series were used. As some compounds were measured with two different frequencies, affected compounds needed to be filtered. The time series for those compounds were built using the latest frequency and only values measured in this frequency. Then remaining NAs were filtered too, resulting in time series adjusted to their intended use.  
+Subsequently, multivariate autoregressive models were fit to each of the time series using the function ar(). These models were then used to forecast the development of the air concentration of each compound.  
+Both the time series of mean values and the trends were then plotted for each compound.
+
+## 3.4 Research Question IV
+While searching for regional emission hotspots two approaches were employed: Map based visualization and bar charts. Both approaches were applied to all compounds to allow for comparisons.  
+First, using multiple manipulations, the data was brought into time-wide format [10]. The resulting data frames contained the coordinates, measurements and mean values. These data frames were then used for the visualization approaches.   
+The map-based visualization displays the mean value of a single compound's measurements across all cities.The measurements are visualized using circles, with sizes corresponding to the value. These circles are then drawn on the map and attached with labels displaying the city name.  
+The second approach uses the same data frames but visualizes the mean measurement values as bar charts. These bar charts consist of one bar for each city showing the value and a horizontal line showing the OmH.
+
+\newpage
+# 4. Results
+This chapter details the results obtained by applying the analysis methods described. To support the analysis selected plots will be displayed. Additional plots were relegated to the appendix for reasons of space and layout.
+
+## 4.1 Research Question I
+The plots produced with the aforementioned methods show two interesting results.  
+First, it can be seen that the cities Bocholt, Koeln and Quenhorn provide no measurement data (see Figure \ref{fig:rq1_cadmium}). From this the conclusion that the stations were founded at a later date can be drawn. Furthermore, Hilchenbach only has 10 measurements and was thus founded three years after the beginning of the WDMP. Duisburg Walsum  and Bottrop both lack 10 measurements while Langenfeld misses 11.  
+Due to these these missing measurements and random NAs the total number of available measurements is 379 for Cadmium, 378 for Lead and Nickel and 377 for Zinc.\newline
+
+Taking this amount of total measurements into account, the number of values measured exceeding the OmH is high (see Figure \ref{fig:rq1_total}). Especially Zinc is strikingly high with 228 transgressions in 377 measurements. Cadmium and Lead both total to 151 transgressions while Nickel to 18.  
+Hence, it can be concluded that the air quality at the beginning of the WDMP was poor, thus verifying the hypothesis regarding research question I.\newline
+
+This conclusion however generalizes the situation. As seen in Figure \ref{fig:rq1_lead} for example, a large regional divide can be seen, such as between Eifel and Duisburg Hafen. The measuring station Eifel shows relatively good air quality compared to Duisburg Hafen. Therefore, while exceedances are many, the location needs to be taken into consideration while stating whether the air quality at the beginning of the WDMP was poor (see 4.4).  
+
+```{r rq_1_setup, include = TRUE, echo = FALSE}
+# select measurements of the first 3 years (1998-2001)
+rq1_lead <- lead[1:40, 3:16]
+rq1_cadmium <- cadmium[1:40, 3:16]
+rq1_zinc <- zinc[1:40, 3:16]
+rq1_nickel <- nickel[1:40, 3:16]
+
+# counting NAs for report
+#sum(is.na(rq1_lead[,]))
+#sum(is.na(rq1_cadmium[,]))
+#sum(is.na(rq1_zinc[,]))
+#sum(is.na(rq1_nickel[,]))
+
+# replace NA with 0 -> value not over threshold
+rq1_lead[is.na(rq1_lead)] <- 0
+rq1_cadmium[is.na(rq1_cadmium)] <- 0
+rq1_zinc[is.na(rq1_zinc)] <- 0
+rq1_nickel[is.na(rq1_nickel)] <- 0
+
+# count values higher than threshold
+# source: https://stackoverflow.com/questions/48628332/r-count-numbers-of-certain-values-in-each-column
+lead_trans <- vector()
+  for(i in 1:ncol(rq1_lead)){
+    lead_trans[i] <- length(rq1_lead[rq1_lead[,i] > 2.5 ,i]) 
+  }
+
+cadmium_trans <- vector()
+  for(i in 1:ncol(rq1_cadmium)){
+    cadmium_trans[i] <- length(rq1_cadmium[rq1_cadmium[,i] > 0.11 ,i]) 
+  }
+
+zinc_trans <- vector()
+  for(i in 1:ncol(rq1_zinc)){
+    zinc_trans[i] <- length(rq1_zinc[rq1_zinc[,i] > 51.0 ,i]) 
+  }
+
+nickel_trans <- vector()
+  for(i in 1:ncol(rq1_nickel)){
+    nickel_trans[i] <- length(rq1_nickel[rq1_nickel[,i] > 3.7 ,i]) 
+  }
+
+# building dataframes with exceedances
+cities <- c(as.character(stations[, 1]))
+
+lead_trans_df <- data.frame(City = cities, trans = lead_trans)
+cadmium_trans_df <- data.frame(City = cities, trans = cadmium_trans)
+zinc_trans_df <- data.frame(City = cities, trans = zinc_trans)
+nickel_trans_df <- data.frame(City = cities, trans = nickel_trans)
+
+```
+
+```{r rq_1_cadmium, include = TRUE, echo = FALSE, fig.cap = "Number of Transgressions of Cadmium 1998-2001 (own illustration)\\label{fig:rq1_cadmium}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="ht"}
+# plot transgressions as bar charts
+ggplot(data = cadmium_trans_df, aes(x = City, y = trans)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  geom_text(aes(label = trans), vjust = -0.3, color = "black", size = 3.5) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(
+    x = "City", 
+    y = "No. of Transgressions",
+    title = "Transgressions: Cadmium 1998-2001"
+)
+```
+
+```{r rq_1_total, include = TRUE, echo = FALSE, fig.cap = "Total Transgressions per Compound 1998-2001 (own illustration)\\label{fig:rq1_total}", fig.height = 3.5, fig.width = 5, fig.align = "center", fig.pos="ht!"}
+# sum up the transgressions per compound
+lead_trans_sum <- colSums(lead_trans_df[2])
+cadmium_trans_sum <- colSums(cadmium_trans_df[2])
+nickel_trans_sum <- colSums(nickel_trans_df[2])
+zinc_trans_sum <- colSums(zinc_trans_df[2])
+
+# build data frame
+trans_sum_df <- data.frame(ID = c("Lead", "Cadmium", "Nickel", "Zinc"), value = c(lead_trans_sum[1], cadmium_trans_sum[1], nickel_trans_sum[1], zinc_trans_sum[1]))
+
+# plot sum of transgressions
+ggplot(data = trans_sum_df, aes(x = ID, y = value)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  geom_text(aes(label = value), vjust = -0.3, color = "black", size = 3.5) +
+  labs(
+    x = "Compound", 
+    y = "No. of Transgressions",
+    title = "Total Transgressions per Compound 1998-2001"
+)
+```
+
+```{r rq_1_lead, include = TRUE, echo = FALSE, fig.cap="Number of Transgressions of Lead 1998-2001 (own illustration)\\label{fig:rq1_lead}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="hb!"}
+ggplot(data = lead_trans_df, aes(x = City, y = trans)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  geom_text(aes(label = trans), vjust = -0.3, color = "black", size = 3.5) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(
+    x = "City", 
+    y = "No. of Transgressions",
+    title = "Transgressions: Lead 1998-2001"
+)
+```
+
+\newpage
+\clearpage
+
+## 4.2 Research Question II
+To determine whether the air quality has improved since the beginning of the measurements, both the plots and the table of changes generated can be used.  
+As seen in the table below, the compounds can be categorized into three groups: Decreasing, neutral and increasing concentrations.  
+
+```{r rq_2_setup, include = TRUE, echo = FALSE}
+
+#surpress warnings
+options(warn=-1) 
+
+# select compound data, remove NAs and build data frames
+#30 entries
+mean_arsenic <- arsenic[c(1:30), c(3:16)]
+mean_arsenic <- rowMeans(mean_arsenic, na.rm = TRUE)
+mean_arsenic <- data.frame(ID = c(1:30), mean_arsenic)
+
+#45 entries
+mean_chromium <- chromium[c(1:45), c(3:16)]
+mean_chromium <- rowMeans(mean_chromium, na.rm = TRUE)
+mean_chromium <- data.frame(ID = c(1:45), mean_chromium)
+
+#60 entries
+mean_copper <- copper[c(1:60), c(3:16)]
+mean_copper <- rowMeans(mean_copper, na.rm = TRUE)
+mean_copper <- data.frame(ID = c(1:60), mean_copper)
+
+#150 entries
+mean_cadmium <- cadmium[c(1:150), c(3:16)]
+mean_cadmium <- rowMeans(mean_cadmium, na.rm = TRUE)
+
+mean_lead <- lead[c(1:150), c(3:16)]
+mean_lead <- rowMeans(mean_lead, na.rm = TRUE)
+
+mean_nickel <- nickel[c(1:150), c(3:16)]
+mean_nickel <- rowMeans(mean_nickel, na.rm = TRUE)
+
+mean_zinc <- zinc[c(1:150), c(3:16)]
+mean_zinc <- rowMeans(mean_zinc, na.rm = TRUE)
+
+
+# build combined data frame for compounds with 150 measurements
+mean_150 <- data.frame(ID = c(1:150), mean_cadmium, mean_nickel, mean_lead, mean_zinc)
+
+
+# build timeseries used for trend and changes
+# calculate trend and get last value from it
+# divide starting value by last trend value to get change
+# 30
+arsenic_ts <- mean_arsenic[1:30, 2]
+arsenic_ts <- ts(arsenic_ts, frequency = 5)
+arsenic_trend <- decompose(arsenic_ts)
+arsenic_trend_value <- arsenic_trend$trend[28]
+arsenic_change <- (arsenic_trend_value/mean_arsenic[1, 2])
+
+# 45
+chromium_ts <- mean_chromium[1:45, 2]
+chromium_ts <- ts(chromium_ts, frequency = 5)
+chromium_trend <- decompose(chromium_ts)
+chromium_trend_value <- chromium_trend$trend[43]
+chromium_change <- (chromium_trend_value/mean_chromium[1, 2])
+
+# 11-60
+copper_ts <- mean_copper[11:60, 2]
+copper_ts <- ts(copper_ts, frequency = 5)
+copper_trend <- decompose(copper_ts)
+copper_trend_value <- copper_trend$trend[48]
+copper_change <- (copper_trend_value/mean_copper[1, 2])
+
+# 101-150
+lead_ts <- mean_150[101:150, 4]
+lead_ts <- ts(lead_ts, frequency = 5)
+lead_trend <- decompose(lead_ts)
+lead_trend_value <- lead_trend$trend[48]
+lead_change <- (lead_trend_value/mean_150[1, 4])
+
+cadmium_ts <- mean_150[101:150, 2]
+cadmium_ts <- ts(cadmium_ts, frequency = 5)
+cadmium_trend <- decompose(cadmium_ts)
+cadmium_trend_value <- cadmium_trend$trend[48]
+cadmium_change <- (cadmium_trend_value/mean_150[1, 2])
+
+nickel_ts <- mean_150[101:150, 3]
+nickel_ts <- ts(nickel_ts, frequency = 5)
+nickel_trend <- decompose(nickel_ts)
+nickel_trend_value <- nickel_trend$trend[48]
+nickel_change <- (nickel_trend_value/mean_150[1, 3])
+
+zinc_ts <- mean_150[101:150, 5]
+zinc_ts <- ts(zinc_ts, frequency = 5)
+zinc_trend <- decompose(zinc_ts)
+zinc_trend_value <- zinc_trend$trend[48]
+zinc_change <- (zinc_trend_value/mean_150[1, 5])
+
+
+# compile changes into one data frame
+changes_df <- data.frame(Compound = c("Arsenic", "Cadmium", "Chromium", "Copper", "Lead", "Nickel", "Zinc"), New_Value = c(arsenic_change, cadmium_change, chromium_change, copper_change, lead_change, nickel_change, zinc_change))
+```
+
+```{r rq_2_changes_df, include = TRUE, echo = FALSE}
+# print changes
+changes_df_tmp <- changes_df[,2]
+tmp <- c(100, 100, 100, 100, 100, 100, 100)
+change <- changes_df_tmp * tmp
+change <- change - tmp
+change <- data.frame(Compound = c("Arsenic", "Cadmium", "Chromium", "Copper", "Lead", "Nickel", "Zinc"), Percentage_of_Change = change)
+change
+```
+The concentration of Arsenic has increased drastically, indicating worsening conditions.  
+The concentrations of Cadmium, Chromium, Lead, Nickel and Zinc in contrast have decreased. Especially Cadmium, Lead and Zinc concentrations have diminished substantily. This indicates an improvement of air quality.  
+The Copper concentration stayed roughly the same during the measurement period, which is not contradictory to an improvement of air quality.  
+The same tendencies can be seen in the bar chart (see Figure \ref{fig:rq2_changes}).\newline
+
+In summary it can be said that, due to five decreasing compound concentrations and a single increasing one, the air quality has improved significantly. 
+
+```{r rq_2_changes, include = TRUE, echo = FALSE, fig.cap = "Changes in Compound Concentration between 1998 and 2017 (own illustration)\\label{fig:rq2_changes}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="ht!"}
+# shift changes by substracting one to get development relative to initial value
+changes_df_shifted <- cbind("Change" = changes_df[,2]-1 )
+changes_df_shifted <- data.frame(changes_df$Compound, changes_df_shifted)
+
+# plot shifted values as bar chart
+ggplot() + 
+  geom_bar(data = changes_df_shifted, aes(x = changes_df.Compound, y = Change, fill = changes_df.Compound), stat = "identity") +
+  scale_fill_brewer(type = "seq", palette = 1) +
+  theme(legend.position = "none") +
+  labs(
+    x = "Compound", 
+    y = "Change",
+    title = "Changes in Compound Concentration during WDMP"
+)
+``` 
+
+```{r rq_2_setup2, include = TRUE, echo = FALSE}
+# filling trends with NAs for plotting
+# 30
+trend_arsenic_df <- data.frame(mean_arsenic, arsenic_trend$trend)
+
+# 45
+trend_chromium_df <- data.frame(mean_chromium, chromium_trend$trend)
+
+# 10 + 50
+copper_trend_filled <- c(rep(NA, 10), copper_trend$trend)
+trend_copper_df <- data.frame(mean_copper, copper_trend_filled)
+
+# 100 + 50
+lead_trend_filled<- c(rep(NA, 100), lead_trend$trend)
+cadmium_trend_filled<- c(rep(NA, 100), cadmium_trend$trend)
+nickel_trend_filled<- c(rep(NA, 100), nickel_trend$trend)
+zinc_trend_filled<- c(rep(NA, 100), zinc_trend$trend)
+
+# complie filled vectors with trend of 150 measurement compounds into single data frame
+trend_150_df <- data.frame(ID = c(1:150), mean_lead, lead_trend_filled, mean_cadmium, cadmium_trend_filled, mean_nickel, nickel_trend_filled, mean_zinc, zinc_trend_filled )
+```
+
+\newpage
+Furthermore, besides these percentage changes the compounds were analysed using time series. Here selected examples for each of the compound groups will be analyzed.\newline
+
+\textbf{Increasing Compounds}. The time series of average Arsenic (see Figure \ref{fig:rq2_arsenic}) measurements clearly shows a large increase of this concentration from measurement 10 to measurement 25. Between measurement 20 and measurement 30 a steep decline in concentration is visible.  
+Futhermore, the trend does not fit the time series well towards the end, thus rendering the change calculation imprecise.
+
+```{r rq_2_arsenic, include = TRUE, echo = FALSE, fig.cap = "Development of Arsenic Concentration (own illustration)\\label{fig:rq2_arsenic}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = trend_arsenic_df, aes(x = ID)) +
+  geom_line(aes(y = mean_arsenic, color = "Mean")) +
+  geom_line(aes(y = arsenic_trend.trend, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Arsenic[mg]/ dry Matter[kg]",
+    title = "Average Arsenic Concentration",
+    colour = "Legend"
+)
+```
+
+\newpage 
+
+\textbf{Decreasing Compounds}. The time series of the compounds in the decreasing group all show a similar progression, as exemplified in Figure \ref{fig:rq_2_cadmium} and Figure \ref{fig:rq_2_chromium}. This progression is characterized by a downward trend in the more recent measurements and an upward spike in the most recent one. Due to this downward trend an improvement of air quality can be concludeded  from these plots.
+
+```{r rq_2_cadmium, include = TRUE, echo = FALSE, fig.cap = "Development Cadmium Concentration (own illustration)\\label{fig:rq2_cadmium}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = trend_150_df, aes(x = ID)) +
+  geom_line(aes(y = mean_cadmium, color = "Mean")) +
+  geom_line(aes(y = cadmium_trend_filled, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Cadmium[mg]/ dry Matter[kg]",
+    title = "Average Cadmium Measurement",
+    colour = "Legend"
+)
+```
+
+```{r rq_2_chromium, include = TRUE, echo = FALSE, fig.cap = "Development Chromium Concentration (own illustration)\\label{fig:rq2_chromium}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = trend_chromium_df, aes(x = ID)) +
+  geom_line(aes(y = mean_chromium, color = "Mean")) +
+  geom_line(aes(y = chromium_trend.trend, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Chromium[mg]/ dry Matter[kg]",
+    title = "Average Chromium Measurement",
+    colour = "Legend"
+)
+```
+
+\newpage
+\textbf{Neutral Compounds}. As can be assumed from the earlier calculations the Copper time series does not have as clear of a tendency. High values alternate with lower values. Towards the end of the time series a slight downwards trend is visible though. The most recent values show a repetition of this pattern. This time series too ends on an upward spike. 
+
+```{r rq_2_copper, include = TRUE, echo = FALSE, fig.cap = "Development Copper Concentration (own illustration)\\label{fig:rq2_copper}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="ht!"}
+ggplot(data = trend_copper_df, aes(x = ID)) +
+  geom_line(aes(y = mean_copper, color = "Mean")) +
+  geom_line(aes(y = copper_trend_filled, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Copper[mg]/ dry Matter[kg]",
+    title = "Average Copper Measurement",
+    colour = "Legend"
+)
+```
+
+Analyzing these plots and the bar chart it can be summarized that the air quality has improved since the beginning of the measurements. Therefore, the hypothesis "The air quality has improved since 1998" stated in 1.3 can be confirmed.
+
+\newpage
+
+## 4.3 Research Question III
+To estimate the future development of compound concentrations forecasts were made. The results of these forecasts can be grouped into two categories: Increasing and neutral\newline
+
+\textbf{Increasing}. The compounds Arsenic, Chromium, Copper, Lead, Nickel and Zinc belong to the category of increasing values. This development is examplified by Nickel (Figure \ref{fig:rq3_nickel}) and Arsenic (Figure \ref{fig:rq3_arsenic}).  
+While Nickel shows a clear upward trend, Arsenic displays periodicity. Despite this periodicity Arsenic's overall concentration trend is still rising.
+
+```{r rq_3_nickel, include = TRUE, echo = FALSE, fig.cap = "Forecast of Nickel Concentration (own illustration)\\label{fig:rq3_nickel}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+nickel_new <- nickel[101:150, 3:16] 
+nickel_new <- ts(as.matrix(nickel_new), start = c(2008, 5), end = c(2017, 9), frequency = 5)
+nickel_new <- ts(nickel_new[!is.na(nickel_new)])
+plot(forecast(ar(nickel_new), h=20), main="Forecast of Nickel Concentration", xlab="Measurement", ylab="Nickel[mg]/ dry Matter[kg]")
+
+```
+
+```{r rq3_arsenic, include = TRUE, echo = FALSE, fig.cap = "Forecast of Arsenic Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+arsenic_new <- arsenic[1:30, 3:16]
+arsenic_new <- ts(as.matrix(arsenic_new), start = c(2012, 5), end = c(2017, 9), frequency = 5)
+arsenic_new <- ts(arsenic_new[!is.na(arsenic_new)])
+plot(forecast(ar(arsenic_new), h=20), main = "Forecast of Arsenic Concentration", xlab = "Measurement", ylab = "Arsenic[mg]/ dry Matter[kg]")
+```
+
+\newpage
+
+\textbf{Neutral}. The category of neutral compound concentration trends consists of Cadmium. As seen in FIgure \ref{fig:rq3_cadmium} Cadmium posseses a neutral trend, neither increasing nor decreasing in concentration.
+
+```{r rq_3_cadmium, include = TRUE, echo = FALSE, fig.cap = "Forecast of Cadmium Concentration (own illustration)\\label{fig:rq3_cadmium}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+cadmium_new <- cadmium[101:150, 3:16]
+cadmium_new <- ts(as.matrix(cadmium_new), start = c(2008, 5), end = c(2017, 9), frequency = 5)
+cadmium_new <- ts(cadmium_new[!is.na(cadmium_new)])
+plot(forecast(ar(cadmium_new), h=20), main = "Forecast of Cadmium Concentration", xlab = "Measurement", ylab = "Cadmium[mg]/ dry Matter[kg]")
+```
+
+In summary there are six increasing compound concentrations and a single neutral one. The lack of a decreasing category and the abundance of increasing concentrations lead to the conclusion that compound concentrations in general will rise in the near future. Thus, the hypothesis that air quality "will continue to improve (see 1.3)" stands corrected.  
+Therefore, the answer to reasearch question III is that the air quality will deteriorate.
+
+\clearpage
+\newpage
+
+## 4.4 Research Question IV
+To determine the existence of regional hotpots of pollution map-based visualizations and bar charts were employed.  
+The bar charts can be used to find large differences in measurements. In conjunction with the map-based visualization these differences can be integrated spatially.  
+The results of this method present a mixed picture. Some compounds have large spatial differences while others are nearly homogenous across NRW.\newline
+
+Lead for one has high regional differences as seen in Figure \ref{fig:rq4_lead_map} and Figure \ref{fig:rq4_lead_bar}. This difference can be seen especially while comparing Duisburg Hafen with Bocholt or Köln.  
+Additional regional differences are visible too. The cities Bottrop, Dortmund, Duisburg, Dortmund, Duesseldorf and Essen all exhibit comparatively high values.  
+This cluster roughly corresponds to the Ruhrgebiet. Here higher values were to be expected due to the industrial nature of the region.\newline
+
+```{r rq_4_setup, include = TRUE, echo = FALSE}
+
+# transpose coordinates
+t_coords <- t(stations)
+
+# calculate means of measurements per city
+arsenic_mean <- data.frame(mean = colMeans(arsenic[1:30, 3:16], na.rm = TRUE))
+chromium_mean <- data.frame(mean = colMeans(chromium[1:45, 3:16], na.rm = TRUE))
+copper_mean <- data.frame(mean = colMeans(copper[1:60, 3:16], na.rm = TRUE))
+cadmium_mean <- data.frame(mean = colMeans(cadmium[1:150, 3:16], na.rm = TRUE))
+lead_mean <- data.frame(mean = colMeans(lead[1:150, 3:16], na.rm = TRUE))
+nickel_mean <- data.frame(mean = colMeans(nickel[1:150, 3:16], na.rm = TRUE))
+zinc_mean <- data.frame(mean = colMeans(zinc[1:150, 3:16], na.rm = TRUE))
+```
+
+```{r rq4_lead, include = TRUE, echo = FALSE, fig.cap = "Map of Lead Concentration (own illustration)\\label{fig:rq4_lead_map}", fig.height = 4, fig.width = 6, fig.align = "center", fig.pos="h!"}
+# build data frame 
+lead_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(lead_spatial_df) <- as.character(colnames(lead[3:16]))
+# insert lead measurements
+lead_spatial_df <-rbind(lead_spatial_df, lead[1:150 ,3:16])
+# transpose data frame
+lead_spatial_df <- data.frame(t(lead_spatial_df))
+# edit column names
+colnames(lead_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:150)))
+# add mean to data frame
+lead_spatial_df <- cbind(lead_spatial_df, mean = lead_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = lead_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Lead Concentration per City"
+) 
+```
+```{r rq4_lead_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Lead Concentration (own illustration)\\label{fig:rq4_lead_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+
+ggplot(data = lead_spatial_df, aes(x = rownames(lead_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_hline(yintercept = 2.5) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City", 
+    y = "Lead[mg]/ dry Matter[kg]",
+    title = "Mean Lead Concentration per City"
+) 
+
+```
+
+\newpage
+
+While observing Nickle less of a regional difference is visible.  
+In most cities the measurements range around 2mg with the exceptions of Duisburg Hafen, Duesseldorf and Quenhorn. 
+This circumstance offers two insights.  
+Duisburg Hafen seems to be an outlier as it almost always has the highest value. Furthermore, the regional differences depend on the compound analyzed.\newline
+
+Taking these results into consideration the hypothesis that pollution hotspots exist is partially confirmed. It holds true so far as some regional pollution hotspots exist but fails to encompass every possible compound.
+
+```{r rq_4_nickel, include = TRUE, echo = FALSE, fig.cap = "Map of Nickel Concentration (own illustration)\\label{fig:rq4_nickel_map}", fig.height = 4, fig.width = 6, fig.align = "center", fig.pos="h!"}
+# build data frame 
+nickel_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(nickel_spatial_df) <- as.character(colnames(nickel[3:16]))
+# insert nickel measurements
+nickel_spatial_df <-rbind(nickel_spatial_df, nickel[1:150 ,3:16])
+# transpose data frame
+nickel_spatial_df <- data.frame(t(nickel_spatial_df))
+# edit column names
+colnames(nickel_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:150)))
+# add mean to data frame
+nickel_spatial_df <- cbind(nickel_spatial_df, mean = nickel_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = nickel_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Nickel Concentration per City"
+) 
+```
+```{r rq_4_nickel_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Nickel Concentration (own illustration)\\label{fig:rq4_nickel_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = nickel_spatial_df, aes(x = rownames(nickel_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_hline(yintercept = 3.7) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City",
+    y = "Nickel[mg]/ dry Matter[kg]",
+    title = "Mean Nickel Concentration per City"
+) 
+
+```
+
+\clearpage
+\newpage
+
+# 5. Conclusion
+
+During the analysis multiple challenges arose.  
+First the inconsistencies in the data made it far more complex to work with than anticpated. Especially the irregular measurement frequencies made the temporal aspect of the analysis very complicated, forcing a makeshift solution in leaving data out. Furthermore, due to the structure on the data, time stamps could not be used as x-axis, instead measurement numbers or IDs had to be used.  
+The different amount of measurements too caused some difficulties. These difficulties however could be circumvented by treating the different data sets in specific ways, depending on the amount of measurements.   
+Additionally, further approaches to the analysis did not work out due to unknown reasons (see Appendix: Further Approaches). Spatial correlation failed to compute correctly after numerous attempts. The seasonal decomposition of time series by loess using stl() did not perform either.\newline
+
+Due to these challenges some parts of the analysis could not be conducted as planned. Despite this the general goal of analyzing the air quality in NRW with the WDMP data has been attained.  
+Summarizing it can be said that the air quality in NRW during the beginning of the WDMP was poor but has improved by now. This improvement will most likely not continue though. Hotspots of pollution were found but not for each compound.  
+
+\newpage
+
+# References
+
+[1] LANUV: Wirkungsdauermessprogramm, https://www.lanuv.nrw.de/umwelt/luft/wirkungen-von-luftverunreinigungen/wirkungen-auf-pflanzen/biomonitoring/wirkungsdauermessprogramm/ (last accessed: 16.03.2019)  
+
+[2] Wikipedia: Smog-Krise im Ruhrgebiet https://de.wikipedia.org/wiki/Smog-Krise_im_Ruhrgebiet_1962 (last accessed: 16.03.2019)  
+
+[3] WDR: Damals Smog, heute Diesel - Luftverschmutzung in NRW, https://www1.wdr.de/nachrichten/erster-smog-alarm-100.html (last accessed: 16.03.2019)  
+
+[4] open.nrw: Suche, https://open.nrw/suche (last accessed: 16.03.2019)  
+
+[5] gis-rest.nrw.de: Datendownload - Wirkungsdauermessprogramm (WDMP),
+    http://www.gis-rest.nrw.de/atomFeed/rest/atom/57591770-d69d-4d70-a189-36c1ff7d6b41.html (last accessed: 16.03.2019)  
+
+[6] ArcGIS: Verwaltungsgrenzen Deutschland,
+   https://www.arcgis.com/home/item.html?id=ae25571c60d94ce5b7fcbf74e27c00e0 (last accessed: 16.03.2019)  
+
+[7] LANUV: Fachberichte, https://www.lanuv.nrw.de/fileadmin/lanuvpubl/3_fachberichte/30061.pdf (last accessed: 16.03.2019)  
+
+[8] Stackoverflow: Count numbers of certain values in each column,
+    https://stackoverflow.com/a/48628533 (last accessed: 16.03.2019)  
+
+[9] Stackoverflow: Bar plot with negative and positive values centered on a non-zero value, https://stackoverflow.com/a/24934148 (last accessed: 16.03.2019)  
+
+[10] Edzer Pebesma in Journal of Statistical Software: spacetime: Spatio-Temporal Data in R, https://cran.r-project.org/web/packages/spacetime/vignettes/jss816.pdf (last accessed: 16.03.2019)  
+
+\newpage
+
+# Appendix
+
+\textbf{Introductory Material}\newline
+
+```{r overview, include=TRUE, echo=FALSE, fig.cap="Overview of Compounds (own illustration)\\label{fig:overview}", out.width = "300px", fig.align = "center", fig.pos="h"}
+knitr::include_graphics('./data/overview.png')
+```
+
+\newpage
+
+\textbf{Further Results: Research Question I}\newline
+
+```{r rq_1_nickel, include = TRUE, echo = FALSE, fig.cap = "Number of Transgressions of Nickel 1998-2001 (own illustration)", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="ht!"}
+ggplot(data = nickel_trans_df, aes(x = City, y = trans)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  geom_text(aes(label = trans), vjust = -0.3, color = "black", size = 3.5) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(
+    x = "City", 
+    y = "No. of Transgressions",
+    title = "Transgressions: Nickel 1998-2001"
+)
+```
+
+```{r rq_1_zinc, include = TRUE, echo = FALSE, fig.cap = "Number of Transgressions of Zinc 1998-2001 (own illustration)", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="hb!"}
+ggplot(data = zinc_trans_df, aes(x = City, y = trans)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  geom_text(aes(label = trans), vjust = -0.3, color = "black", size = 3.5) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(
+    x = "City", 
+    y = "No. of Transgressions",
+    title = "Transgressions: Zinc 1998-2001"
+)
+```
+
+\newpage
+\clearpage
+
+\textbf{Further Results: Research Question II}\newline
+
+```{r rq_2_nickel, include = TRUE, echo = FALSE, fig.cap = "Changes in Nickel Concentration (own illustration)\\label{fig:rq2_nickel}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = trend_150_df, aes(x = ID)) +
+  geom_line(aes(y = mean_nickel, color = "Mean")) +
+  geom_line(aes(y = nickel_trend_filled, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Nickel[mg]/ dry Matter[kg]",
+    title = "Average Nickel Measurement",
+    colour = "Legend"
+)
+```
+
+```{r rq_2_lead, include = TRUE, echo = FALSE, fig.cap = "Changes in Lead Concentration (own illustration)\\label{fig:rq2_lead}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = trend_150_df, aes(x = ID)) +
+  geom_line(aes(y = mean_lead, color = "Mean")) +
+  geom_line(aes(y = lead_trend_filled, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Lead[mg]/ dry Matter[kg]",
+    title = "Average Lead Measurement",
+    colour = "Legend"
+)
+```
+
+```{r rq_2_zinc, include = TRUE, echo = FALSE, fig.cap = "Changes in Zinc Concentration (own illustration)\\label{fig:rq2_zinc}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+ggplot(data = trend_150_df, aes(x = ID)) +
+  geom_line(aes(y = mean_zinc, color = "Mean")) +
+  geom_line(aes(y = zinc_trend_filled, color = "Trend")) +
+  labs(
+    x = "Measurement ID", 
+    y = "Lead[mg]/ dry Matter[kg]",
+    title = "Average Zinc Measurement",
+    colour = "Legend"
+)
+```
+
+\newpage
+\clearpage
+
+\textbf{Further Results: Research Question III}\newline
+
+```{r rq_3_chromium, include = TRUE, echo = FALSE, fig.cap = "Forecast of Chromium Concentration (own illustration)\\label{fig:rq3_chromium}", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="ht!"}
+
+# general workflow:
+# 1. Select compound data
+# 2. Build timeseries
+# 3. Filter NAs
+# 4. Fit multivariate autoregressive model to timeseries
+# 5. Forecast using the AR model
+# 6. Plot results
+
+chromium_new <- chromium[1:45, 3:16]
+chromium_new <- ts(as.matrix(chromium_new), start = c(2009, 5), end = c(2017, 9), frequency = 5)
+chromium_new <- ts(chromium_new[!is.na(chromium_new)])
+plot(forecast(ar(chromium_new), h=20), main = "Forecast of Chromium Concentration", xlab = "Measurement", ylab = "Chromium[mg]/ dry Matter[kg]")
+```
+
+```{r rq_3_Copper, include = TRUE, echo = FALSE, fig.cap = "Forecast of Copper Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+copper_new <- copper[10:60, 3:16] 
+copper_new <- ts(as.matrix(copper_new), start = c(2008, 5), end = c(2017, 9), frequency = 5)
+copper_new <- ts(copper_new[!is.na(copper_new)])
+plot(forecast(ar(copper_new), h=20), main="Forecast of Copper Concentration", xlab="Measurement", ylab="Copper[mg]/ dry Matter[kg]")
+```
+
+```{r rq_3_lead, include = TRUE, echo = FALSE, fig.cap = "Forecast of Lead Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+lead_new <- lead[101:150, 3:16] 
+lead_new <- ts(as.matrix(lead_new), start = c(2008, 5), end = c(2017, 9), frequency = 5)
+lead_new <- ts(lead_new[!is.na(lead_new)])
+plot(forecast(ar(lead_new), h=20), main="Forecast of Lead Concentration", xlab="Measurement", ylab="Lead[mg]/ dry Matter[kg]")
+```
+
+```{r rq_3_zinc, include = TRUE, echo = FALSE, fig.cap = "Forecast of Zinc Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+zinc_new <- zinc[101:150, 3:16] 
+zinc_new <- ts(as.matrix(zinc_new), start = c(2008, 5), end = c(2017, 9), frequency = 5)
+zinc_new <- ts(zinc_new[!is.na(zinc_new)])
+plot(forecast(ar(zinc_new), h=20), main="Forecast of Zinc Concentration", xlab="Measurement", ylab="Zinc[mg]/ dry Matter[kg]")
+
+```
+
+\newpage
+\clearpage
+
+\textbf{Further Results: Research Question IV}\newline
+
+```{r rq_4_arsenic, include = TRUE, echo = FALSE, fig.cap = "Map of Arsenic Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+# build data frame 
+arsenic_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(arsenic_spatial_df) <- as.character(colnames(arsenic[3:16]))
+# insert arsenic measurements
+arsenic_spatial_df <-rbind(arsenic_spatial_df, arsenic[1:150 ,3:16])
+# transpose data frame
+arsenic_spatial_df <- data.frame(t(arsenic_spatial_df))
+# edit column names
+colnames(arsenic_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:30)))
+# add mean to data frame
+arsenic_spatial_df <- cbind(arsenic_spatial_df, mean = arsenic_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = arsenic_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Arsenic Concentration per City"
+)
+```
+```{r rq_4_arsenic_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Arsenic Concentration (own illustration)\\label{fig:rq4_nickel_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+
+ggplot(data = arsenic_spatial_df, aes(x = rownames(arsenic_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City",
+    y = "Arsenic[mg]/ dry Matter[kg]", 
+    title = "Mean Arsenic Concentration per City"
+)
+```
+
+```{r rq_4_cadmium, include = TRUE, echo = FALSE, fig.cap = "Map of Cadmium Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+# build data frame 
+cadmium_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(cadmium_spatial_df) <- as.character(colnames(cadmium[3:16]))
+# insert cadmium measurements
+cadmium_spatial_df <-rbind(cadmium_spatial_df, cadmium[1:150 ,3:16])
+# transpose data frame
+cadmium_spatial_df <- data.frame(t(cadmium_spatial_df))
+# edit column names
+colnames(cadmium_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:150)))
+# add mean to data frame
+cadmium_spatial_df <- cbind(cadmium_spatial_df, mean = cadmium_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = cadmium_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Cadmium Concentration per City"
+)
+```
+```{r rq_4_cadmium_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Cadmium Concentration (own illustration)\\label{fig:rq4_nickel_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+
+ggplot(data = cadmium_spatial_df, aes(x = rownames(cadmium_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_hline(yintercept = 0.11) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City",
+    y = "Cadmium[mg]/ dry Matter[kg]", 
+    title = "Mean Cadmium Concentration per City"
+)
+
+```
+
+```{r rq_4_chromium, include = TRUE, echo = FALSE, fig.cap = "Map of Chromium Concentration (own illustration))", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+# build data frame 
+chromium_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(chromium_spatial_df) <- as.character(colnames(chromium[3:16]))
+# insert chromium measurements
+chromium_spatial_df <-rbind(chromium_spatial_df, chromium[1:150 ,3:16])
+# transpose data frame
+chromium_spatial_df <- data.frame(t(chromium_spatial_df))
+# edit column names
+colnames(chromium_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:45)))
+# add mean to data frame
+chromium_spatial_df <- cbind(chromium_spatial_df, mean = chromium_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = chromium_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Chromium Concentration per City"
+)
+```
+```{r rq_4_chromium_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Chromium Concentration (own illustration)\\label{fig:rq4_nickel_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+
+ggplot(data = chromium_spatial_df, aes(x = rownames(chromium_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_hline(yintercept = 3.6) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City",
+    y = "chromium[mg]/ dry Matter[kg]", 
+    title = "Mean Chromium Concentration per City"
+)
+```
+
+```{r rq_4_copper, include = TRUE, echo = FALSE, fig.cap = "Map of Copper Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+# build data frame 
+copper_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(copper_spatial_df) <- as.character(colnames(copper[3:16]))
+# insert copper measurements
+copper_spatial_df <-rbind(copper_spatial_df, copper[1:150 ,3:16])
+# transpose data frame
+copper_spatial_df <- data.frame(t(copper_spatial_df))
+# edit column names
+colnames(copper_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:30)))
+# add mean to data frame
+copper_spatial_df <- cbind(copper_spatial_df, mean = copper_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = copper_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Copper Concentration per City"
+)
+```
+```{r rq_4_copper_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Copper Concentration (own illustration)\\label{fig:rq4_nickel_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+
+ggplot(data = copper_spatial_df, aes(x = rownames(copper_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_hline(yintercept = 16) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City",
+    y = "copper[mg]/ dry Matter[kg]", 
+    title = "Mean Copper Concentration per City"
+)
+```
+
+```{r rq_4_zinc, include = TRUE, echo = FALSE, fig.cap = "Map of Zinc Concentration (own illustration)", fig.height = 3, fig.width = 5, fig.align = "center", fig.pos="h!"}
+# build data frame 
+zinc_spatial_df <- rbind.data.frame((as.numeric(t_coords[2, ])), (as.numeric(t_coords[3, ])))
+# edit column names
+colnames(zinc_spatial_df) <- as.character(colnames(zinc[3:16]))
+# insert zinc measurements
+zinc_spatial_df <-rbind(zinc_spatial_df, zinc[1:150 ,3:16])
+# transpose data frame
+zinc_spatial_df <- data.frame(t(zinc_spatial_df))
+# edit column names
+colnames(zinc_spatial_df) <- c("long", "lat", sprintf("ID%s", seq(1:150)))
+# add mean to data frame
+zinc_spatial_df <- cbind(zinc_spatial_df, mean = zinc_mean[,1])
+
+ggplot(data = nrw.df, aes(x = long, y = lat)) + 
+  geom_polygon() + 
+  theme(legend.position = "none") +
+  geom_point(data = zinc_spatial_df, aes(size = mean, color="steelblue", alpha = 3/4)) +
+  geom_label_repel(data = stations, aes(label = name),
+  fill = "white",
+  box.padding   = 0.35, 
+  point.padding = 0.5,
+  segment.color = 'grey50') +
+  labs(
+    x = "Longitude",
+    y = "Latitude", 
+    title = "Mean Zinc Concentration per City"
+)
+```
+```{r rq_4_zinc_bar, include = TRUE, echo = FALSE, fig.cap = "Chart of Zinc Concentration (own illustration)\\label{fig:rq4_nickel_bar}", fig.height = 4, fig.width = 5, fig.align = "center", fig.pos="h!"}
+
+ggplot(data = zinc_spatial_df, aes(x = rownames(zinc_spatial_df), y = mean))+
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_hline(yintercept = 50) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+    labs(
+    x = "City",
+    y = "Zinc[mg]/ dry Matter[kg]", 
+    title = "Mean Zinc Concentration per City"
+)
+```
+
+\newpage
+\clearpage
+
+\textbf{Further Approaches}
+
+```{r non_functioning, include=TRUE, echo=TRUE, eval=FALSE, fig.align = "center", fig.pos="h!"}
+# the following approaches were taken into consideration:
+
+acf(chromium_new)
+pacf(chromium_new)
+
+# spatial correlation
+crs <- CRS("+init=epsg:25832")
+coordinates(lead_spatial_df) <- ~long+lat
+proj4string(lead_spatial_df) <- crs
+print(cor(lead_spatial_df@data[1:5, 1:5]))
+
+# variogram and kriging: few stations, larg area 
+# -> meaningless as discussed in last presentation
+vario <- (variogram(log(mean)~1, lead_spatial_df))
+vario.fit <- fit.variogram(vario, model=vgm(1, "Sph", 900, 1))
+plot(vario, vario.fit, cutoff=100)
+
+# stl
+stl(chromium_new)
+```
